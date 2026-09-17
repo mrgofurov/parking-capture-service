@@ -1,0 +1,11 @@
+# Binaries
+capture-service
+*.exe
+*.test
+
+# Environment
+.env
+
+# Runtime data & snapshots
+snapshots/
+*.log

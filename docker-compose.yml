@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  parking-capture-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: parking_capture_service
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    environment:
+      - SERVICE_PORT=8086
+      - BACKEND_URL=http://parking_backend:8085
+      - SYNTHETIC_MODE=true
+      - DEFAULT_FPS=8
+      - STORAGE_BEST_FRAME=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - capture_snapshots:/app/snapshots
+    networks:
+      - delivery-network
+
+volumes:
+  capture_snapshots:
+
+networks:
+  delivery-network:
+    external: true
