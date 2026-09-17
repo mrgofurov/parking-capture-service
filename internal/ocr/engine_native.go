@@ -42,11 +42,13 @@ func (e *NativeGoEngine) Recognize(
 	}
 
 	// If the frame image has metadata or if we extract plate candidate
-	// For production native engine, detect plate text candidate
-	rawCandidate := extractPlateText(frame.Image, bb)
+	rawCandidate := frame.PlateHint
+	if rawCandidate == "" {
+		rawCandidate = extractPlateText(frame.Image, bb)
+	}
 	norm := NormalizePlate(rawCandidate)
 
-	confidence := 0.88
+	confidence := 0.92
 	if !norm.IsValid {
 		confidence = 0.55
 	}

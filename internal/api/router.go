@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bufio"
 	"context"
+	"fmt"
+	"io"
 
 	"github.com/gofiber/adaptor/v2"
 	"github.com/gofiber/fiber/v2"
@@ -63,6 +66,91 @@ func SetupRouter(app *fiber.App, camManager *camera.Manager) {
 		return c.JSON(fiber.Map{
 			"success": true,
 			"message": "Avtomobil o'tishi muvaffaqiyatli simulyatsiya qilindi",
+		})
+	})
+
+	v1.Get("/cameras/:id/snapshot", func(c *fiber.Ctx) error {
+		camID := c.Params("id")
+		b := camManager.GetLatestSnapshot(camID)
+		if len(b) == 0 {
+			return c.Status(fiber.StatusNotFound).SendString("Snapshot mavjud emas")
+		}
+		c.Set("Content-Type", "image/jpeg")
+		c.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		return c.Send(b)
+	})
+
+	v1.Get("/cameras/:id/stream", func(c *fiber.Ctx) error {
+		camID := c.Params("id")
+		ch, unsub := camManager.SubscribeStream(camID)
+		if ch == nil {
+			return c.Status(fiber.StatusNotFound).SendString("Kamera topilmadi")
+		}
+
+		c.Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+		c.Set("Cache-Control", "no-cache")
+		c.Set("Connection", "keep-alive")
+		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+			defer unsub()
+			for frameBytes := range ch {
+				if len(frameBytes) == 0 {
+					continue
+				}
+				_, err := fmt.Fprintf(w, "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", len(frameBytes))
+				if err != nil {
+					return
+				}
+				if _, err := w.Write(frameBytes); err != nil {
+					return
+				}
+				if _, err := fmt.Fprintf(w, "\r\n"); err != nil {
+					return
+				}
+				if err := w.Flush(); err != nil {
+					return
+				}
+			}
+		})
+		return nil
+	})
+
+	v1.Post("/cameras/:id/test-image", func(c *fiber.Ctx) error {
+		camID := c.Params("id")
+		file, err := c.FormFile("image")
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"message": "Rasm fayli (image form-data) yuklanmadi",
+			})
+		}
+		f, err := file.Open()
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"success": false,
+				"message": "Faylni ochishda xatolik",
+			})
+		}
+		defer f.Close()
+
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"success": false,
+				"message": "Fayl ma'lumotlarini o'qishda xatolik",
+			})
+		}
+
+		res, err := camManager.TestImageOCR(camID, data)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"message": err.Error(),
+			})
+		}
+
+		return c.JSON(fiber.Map{
+			"success": true,
+			"data":    res,
 		})
 	})
 

@@ -48,6 +48,7 @@ type Frame struct {
 	JPEGBytes  []byte
 	Width      int
 	Height     int
+	PlateHint  string
 }
 
 type BoundingBox struct {

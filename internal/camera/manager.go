@@ -1,9 +1,13 @@
 package camera
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"log"
 	"sync"
 	"time"
@@ -30,6 +34,8 @@ type CameraPipeline struct {
 	frameChan       chan *domain.Frame
 	cancelFunc      context.CancelFunc
 	lastRecognition *domain.RecognitionResult
+	lastFrame       *domain.Frame
+	streamClients   map[chan []byte]bool
 	mu              sync.RWMutex
 }
 
@@ -70,13 +76,14 @@ func (m *Manager) RegisterCamera(cam domain.CameraConfig, b barrier.Controller) 
 	sm := statemachine.NewRecognitionStateMachine(cam.ID, time.Duration(m.cfg.BarrierPassageTimeoutSec)*time.Second)
 
 	pipe := &CameraPipeline{
-		Config:       cam,
-		Capturer:     capturer,
-		Tracker:      tracker,
-		Consensus:    consensus,
-		StateMachine: sm,
-		Barrier:      b,
-		frameChan:    make(chan *domain.Frame, m.cfg.MaxFrameQueue),
+		Config:        cam,
+		Capturer:      capturer,
+		Tracker:       tracker,
+		Consensus:     consensus,
+		StateMachine:  sm,
+		Barrier:       b,
+		frameChan:     make(chan *domain.Frame, m.cfg.MaxFrameQueue),
+		streamClients: make(map[chan []byte]bool),
 	}
 
 	m.pipelines[cam.ID] = pipe
@@ -118,6 +125,17 @@ func (m *Manager) startPipeline(ctx context.Context, pipe *CameraPipeline) {
 
 func (m *Manager) processFrame(ctx context.Context, pipe *CameraPipeline, frame *domain.Frame) {
 	metrics.Global.FramesProcessedTotal.WithLabelValues(pipe.Config.ID).Inc()
+
+	// Update last frame & broadcast to stream subscribers
+	pipe.mu.Lock()
+	pipe.lastFrame = frame
+	for ch := range pipe.streamClients {
+		select {
+		case ch <- frame.JPEGBytes:
+		default:
+		}
+	}
+	pipe.mu.Unlock()
 
 	// 1. Vehicle Tracking
 	vehicle := pipe.Tracker.ProcessFrame(frame, &pipe.Config)
@@ -283,6 +301,100 @@ func (m *Manager) GetBarrier(id string) barrier.Controller {
 		}
 	}
 	return nil
+}
+
+func (m *Manager) GetLatestSnapshot(cameraID string) []byte {
+	m.mu.RLock()
+	pipe, ok := m.pipelines[cameraID]
+	m.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	pipe.mu.RLock()
+	defer pipe.mu.RUnlock()
+	if pipe.lastFrame != nil {
+		return pipe.lastFrame.JPEGBytes
+	}
+	return nil
+}
+
+func (m *Manager) SubscribeStream(cameraID string) (chan []byte, func()) {
+	m.mu.RLock()
+	pipe, ok := m.pipelines[cameraID]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, func() {}
+	}
+
+	ch := make(chan []byte, 10)
+	pipe.mu.Lock()
+	if pipe.streamClients == nil {
+		pipe.streamClients = make(map[chan []byte]bool)
+	}
+	pipe.streamClients[ch] = true
+	// Send latest frame immediately if available
+	if pipe.lastFrame != nil {
+		select {
+		case ch <- pipe.lastFrame.JPEGBytes:
+		default:
+		}
+	}
+	pipe.mu.Unlock()
+
+	unsub := func() {
+		pipe.mu.Lock()
+		delete(pipe.streamClients, ch)
+		close(ch)
+		pipe.mu.Unlock()
+	}
+
+	return ch, unsub
+}
+
+func (m *Manager) TestImageOCR(cameraID string, imgBytes []byte) (map[string]interface{}, error) {
+	start := time.Now()
+	img, _, err := image.Decode(bytes.NewReader(imgBytes))
+	if err != nil {
+		return nil, fmt.Errorf("rasmni dekodlab bo'lmadi: %w", err)
+	}
+
+	frame := &domain.Frame{
+		CameraID:  cameraID,
+		Timestamp: time.Now(),
+		Image:     img,
+		JPEGBytes: imgBytes,
+		Width:     img.Bounds().Dx(),
+		Height:    img.Bounds().Dy(),
+	}
+
+	dummyVeh := &domain.VehicleObservation{
+		TrackingID: "test-upload-" + uuid.New().String()[:8],
+		BoundingBox: domain.BoundingBox{
+			X:      int(float64(img.Bounds().Dx()) * 0.2),
+			Y:      int(float64(img.Bounds().Dy()) * 0.2),
+			Width:  int(float64(img.Bounds().Dx()) * 0.6),
+			Height: int(float64(img.Bounds().Dy()) * 0.6),
+		},
+	}
+
+	obsList, err := m.recognizer.Recognize(context.Background(), frame, dummyVeh)
+	if err != nil || len(obsList) == 0 {
+		return nil, fmt.Errorf("davlat raqami aniqlanmadi")
+	}
+
+	obs := obsList[0]
+	dur := time.Since(start).Milliseconds()
+
+	return map[string]interface{}{
+		"plate_number": obs.NormalizedText,
+		"raw_text":     obs.RawText,
+		"confidence":   obs.Confidence,
+		"sharpness":    obs.Sharpness,
+		"brightness":   obs.Brightness,
+		"contrast":     obs.Contrast,
+		"latency_ms":   dur,
+		"timestamp":    obs.Timestamp,
+	}, nil
 }
 
 func (m *Manager) StopAll() {
