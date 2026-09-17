@@ -9,6 +9,8 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"log"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -256,11 +258,18 @@ func (m *Manager) ListCameras() []map[string]interface{} {
 		}
 		p.mu.RUnlock()
 
+		mode := "SYNTHETIC"
+		if _, isRTSP := p.Capturer.(*capture.FFmpegRTSPCapturer); isRTSP {
+			mode = "RTSP"
+		}
+
 		res = append(res, map[string]interface{}{
 			"id":               p.Config.ID,
 			"name":             p.Config.Name,
 			"direction":        p.Config.Direction,
 			"fps":              p.Config.FPS,
+			"rtsp_url":         p.Config.RTSPURL,
+			"mode":             mode,
 			"status":           p.Capturer.Status(),
 			"state":            p.StateMachine.CurrentState(),
 			"last_recognition": lastPlate,
@@ -394,6 +403,86 @@ func (m *Manager) TestImageOCR(cameraID string, imgBytes []byte) (map[string]int
 		"contrast":     obs.Contrast,
 		"latency_ms":   dur,
 		"timestamp":    obs.Timestamp,
+	}, nil
+}
+
+func (m *Manager) ReconfigureCamera(cameraID, mode, rtspURL string, fps int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	pipe, ok := m.pipelines[cameraID]
+	if !ok {
+		return fmt.Errorf("kamera topilmadi: %s", cameraID)
+	}
+
+	// Stop existing capturer
+	if pipe.cancelFunc != nil {
+		pipe.cancelFunc()
+	}
+	_ = pipe.Capturer.Stop()
+
+	// Update config
+	pipe.Config.RTSPURL = rtspURL
+	if fps > 0 {
+		pipe.Config.FPS = fps
+	}
+
+	if mode == "SYNTHETIC" || (mode != "RTSP" && rtspURL == "") {
+		pipe.Capturer = capture.NewSyntheticCapturer(cameraID, pipe.Config.Direction, pipe.Config.FPS)
+	} else {
+		pipe.Capturer = capture.NewFFmpegRTSPCapturer(cameraID, rtspURL, pipe.Config.FPS)
+	}
+
+	// Restart pipeline worker
+	m.startPipeline(context.Background(), pipe)
+
+	log.Printf("[CameraManager] Camera %s reconfigured. Mode: %s, Source: %s, FPS: %d\n", cameraID, mode, rtspURL, pipe.Config.FPS)
+	return nil
+}
+
+func (m *Manager) TestRTSPConnection(rtspURL string) (map[string]interface{}, error) {
+	if rtspURL == "" {
+		return nil, fmt.Errorf("RTSP URL yoki video fayl manzili kiritilishi shart")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	var args []string
+	if strings.HasPrefix(rtspURL, "rtsp://") || strings.HasPrefix(rtspURL, "rtsps://") {
+		args = []string{
+			"-hide_banner",
+			"-loglevel", "error",
+			"-rtsp_transport", "tcp",
+			"-i", rtspURL,
+			"-frames:v", "1",
+			"-f", "null",
+			"-",
+		}
+	} else {
+		args = []string{
+			"-hide_banner",
+			"-loglevel", "error",
+			"-i", rtspURL,
+			"-frames:v", "1",
+			"-f", "null",
+			"-",
+		}
+	}
+
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	output, err := cmd.CombinedOutput()
+	dur := time.Since(start).Milliseconds()
+
+	if err != nil {
+		return nil, fmt.Errorf("kamera oqimi ochilmadi: %s", strings.TrimSpace(string(output)))
+	}
+
+	return map[string]interface{}{
+		"success":    true,
+		"latency_ms": dur,
+		"message":    fmt.Sprintf("Kamera oqimi muvaffaqiyatli tekshirildi (%d ms)", dur),
 	}, nil
 }
 

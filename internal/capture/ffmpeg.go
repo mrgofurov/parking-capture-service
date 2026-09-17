@@ -9,6 +9,7 @@ import (
 	"log"
 	"math/rand"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -109,15 +110,31 @@ func (c *FFmpegRTSPCapturer) runSupervisor(ctx context.Context, out chan<- *doma
 }
 
 func (c *FFmpegRTSPCapturer) streamOnce(ctx context.Context, out chan<- *domain.Frame) error {
-	args := []string{
-		"-hide_banner",
-		"-loglevel", "error",
-		"-rtsp_transport", "tcp",
-		"-i", c.rtspURL,
-		"-vf", fmt.Sprintf("fps=%d", c.fps),
-		"-f", "image2pipe",
-		"-vcodec", "mjpeg",
-		"-",
+	var args []string
+	if strings.HasPrefix(c.rtspURL, "rtsp://") || strings.HasPrefix(c.rtspURL, "rtsps://") {
+		args = []string{
+			"-hide_banner",
+			"-loglevel", "error",
+			"-rtsp_transport", "tcp",
+			"-i", c.rtspURL,
+			"-vf", fmt.Sprintf("fps=%d", c.fps),
+			"-f", "image2pipe",
+			"-vcodec", "mjpeg",
+			"-",
+		}
+	} else {
+		// Video file loop mode for real video testing
+		args = []string{
+			"-hide_banner",
+			"-loglevel", "error",
+			"-stream_loop", "-1",
+			"-re",
+			"-i", c.rtspURL,
+			"-vf", fmt.Sprintf("fps=%d", c.fps),
+			"-f", "image2pipe",
+			"-vcodec", "mjpeg",
+			"-",
+		}
 	}
 
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)

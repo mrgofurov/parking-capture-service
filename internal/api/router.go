@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"time"
 
 	"github.com/gofiber/adaptor/v2"
 	"github.com/gofiber/fiber/v2"
@@ -151,6 +153,87 @@ func SetupRouter(app *fiber.App, camManager *camera.Manager) {
 		return c.JSON(fiber.Map{
 			"success": true,
 			"data":    res,
+		})
+	})
+
+	type CameraConfigRequest struct {
+		Mode    string `json:"mode"`
+		RTSPURL string `json:"rtsp_url"`
+		FPS     int    `json:"fps"`
+	}
+
+	v1.Put("/cameras/:id/config", func(c *fiber.Ctx) error {
+		camID := c.Params("id")
+		var req CameraConfigRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"message": "Noto'g'ri so'rov parametrlari",
+			})
+		}
+
+		err := camManager.ReconfigureCamera(camID, req.Mode, req.RTSPURL, req.FPS)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"message": err.Error(),
+			})
+		}
+
+		return c.JSON(fiber.Map{
+			"success": true,
+			"message": "Kamera sozlamalari muvaffaqiyatli saqlandi va ishga tushirildi",
+		})
+	})
+
+	type TestRTSPRequest struct {
+		RTSPURL string `json:"rtsp_url"`
+	}
+
+	v1.Post("/cameras/:id/test-rtsp", func(c *fiber.Ctx) error {
+		var req TestRTSPRequest
+		_ = c.BodyParser(&req)
+		res, err := camManager.TestRTSPConnection(req.RTSPURL)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"message": err.Error(),
+			})
+		}
+		return c.JSON(res)
+	})
+
+	v1.Post("/cameras/:id/upload-video", func(c *fiber.Ctx) error {
+		camID := c.Params("id")
+		file, err := c.FormFile("video")
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"success": false,
+				"message": "Video fayli yuklanmadi (video form-data)",
+			})
+		}
+
+		_ = os.MkdirAll("./snapshots/videos", 0755)
+		savePath := fmt.Sprintf("./snapshots/videos/%s_%d_%s", camID, time.Now().Unix(), file.Filename)
+		if err := c.SaveFile(file, savePath); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"success": false,
+				"message": "Video faylini saqlashda xatolik: " + err.Error(),
+			})
+		}
+
+		// Reconfigure camera to loop this uploaded video file!
+		if err := camManager.ReconfigureCamera(camID, "RTSP", savePath, 8); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"success": false,
+				"message": err.Error(),
+			})
+		}
+
+		return c.JSON(fiber.Map{
+			"success":   true,
+			"message":   "Haqiqiy test video fayli yuklandi va kamera oqimiga ulandi!",
+			"file_path": savePath,
 		})
 	})
 

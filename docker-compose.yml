@@ -17,12 +17,9 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - capture_snapshots:/app/snapshots
+      - ./snapshots:/app/snapshots
     networks:
       - delivery-network
-
-volumes:
-  capture_snapshots:
 
 networks:
   delivery-network:
