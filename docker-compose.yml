@@ -1,4 +1,3 @@
-
 services:
   parking-capture-service:
     build:
@@ -8,16 +7,21 @@ services:
     restart: unless-stopped
     ports:
       - "8086:8086"
-    environment:
-      - SERVICE_PORT=8086
-      - BACKEND_URL=http://parking_backend:8085
-      - SYNTHETIC_MODE=true
-      - DEFAULT_FPS=8
-      - STORAGE_BEST_FRAME=true
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
     volumes:
       - ./snapshots:/app/snapshots
+      - ./models:/models
+    # To enable GPU acceleration on systems with NVIDIA Container Toolkit, uncomment below:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - delivery-network
 

@@ -1,11 +1,48 @@
-# Binaries
-capture-service
-*.exe
-*.test
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Environment
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+.venv
+
+# Testing & Linting
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local Environment & Secrets
 .env
 
-# Runtime data & snapshots
-snapshots/
-*.log
+# Weights & Deep Learning Models (Except gitkeep)
+models/*.pt
+models/*.onnx
+*.pt
+*.onnx
+
+# Output & Snapshots
+snapshots/*
+!snapshots/.gitkeep
+output/*
+!output/.gitkeep
