@@ -10,12 +10,10 @@ from app.api.diagnostic import router as diagnostic_router
 from app.api.health import router as health_router
 from app.api.metrics import router as metrics_router
 from app.backend.client import BackendClient
-from app.camera.file import FileCameraStream
-from app.camera.rtsp import RTSPCameraStream
+from app.camera.manager import CameraManager
 from app.config import settings
 from app.utils.image import cleanup_expired_captures
 from app.utils.logging import logger, setup_logger
-from app.vision.pipeline import VisionPipeline
 
 
 async def retention_cleanup_loop(upload_dir: str, retention_days: int) -> None:
@@ -36,17 +34,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     setup_logger(level=settings.log_level)
     logger.info("==================================================")
     logger.info("     Smart Parking Capture Service (Python AI)    ")
-    logger.info("     YOLO + ByteTrack + PaddleOCR Multi-Frame     ")
+    logger.info("     Multi-Camera ANPR + YOLO + EasyOCR Engine    ")
     logger.info("==================================================")
 
     # 2. Check Hardware Acceleration
     gpu_available = torch.cuda.is_available()
     device_name = torch.cuda.get_device_name(0) if gpu_available else "CPU"
     logger.info(f"Inference Device: {device_name} (CUDA available: {gpu_available})")
-    logger.info(
-        f"Camera ID: {settings.camera_id}, Direction: {settings.camera_direction}, "
-        f"Source: {settings.video_source}, Target FPS: {settings.target_fps}"
-    )
 
     # 3. Create Backend Client
     backend_client = BackendClient(
@@ -59,36 +53,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     await backend_client.start()
 
-    # 4. Create Camera Stream
-    if settings.video_source.lower() == "file":
-        stream = FileCameraStream(
-            camera_id=settings.camera_id,
-            file_path=settings.video_file,
-            target_fps=settings.target_fps,
-            loop=True,
-        )
-    else:
-        stream = RTSPCameraStream(
-            camera_id=settings.camera_id,
-            rtsp_url=settings.rtsp_url,
-            target_fps=settings.target_fps,
-            max_queue_size=settings.max_frame_queue,
-        )
-
-    # 5. Initialize Vision Pipeline
-    pipeline = VisionPipeline(
+    # 4. Initialize Multi-Camera Manager
+    camera_manager = CameraManager(
         config=settings,
-        camera_stream=stream,
         backend_client=backend_client,
     )
-    await pipeline.start()
+    await camera_manager.start_all()
 
     # Save to app state
     app.state.config = settings
-    app.state.pipeline = pipeline
+    app.state.camera_manager = camera_manager
     app.state.backend = backend_client
 
-    # 6. Start background snapshot retention cleaner
+    # 5. Start background snapshot retention cleaner
     cleanup_task = asyncio.create_task(
         retention_cleanup_loop(settings.upload_dir, settings.capture_retention_days)
     )
@@ -98,7 +75,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Graceful Shutdown
     logger.info("Shutting down Smart Parking Capture Service...")
     cleanup_task.cancel()
-    await pipeline.stop()
+    await camera_manager.stop_all()
     await backend_client.stop()
     logger.info("Smart Parking Capture Service stopped cleanly.")
 
@@ -106,7 +83,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Smart Parking Capture Service",
-        description="Edge AI ANPR service using YOLO and PaddleOCR with Multi-Frame Consensus",
+        description="Edge AI ANPR service using YOLO and OCR with Real-time Multi-Camera Pipeline",
         version="2.0.0",
         lifespan=lifespan,
     )

@@ -60,12 +60,6 @@ class FileCameraStream(BaseCameraStream):
         if not self._running or self.cap is None:
             return False, None
 
-        # Pace frame rate to match target_fps
-        now = time.time()
-        elapsed = now - self._last_read_time
-        if elapsed < self.frame_interval:
-            time.sleep(self.frame_interval - elapsed)
-
         ret, frame = self.cap.read()
         if not ret or frame is None:
             if self.loop:

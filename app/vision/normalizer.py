@@ -67,6 +67,14 @@ def normalize_plate(raw_text: str) -> NormalizationResult:
     """
     cleaned = clean_plate_text(raw_text)
 
+    # Smart correction: If 6 characters like B456CD, region code 01 was omitted
+    if len(cleaned) == 6 and cleaned[0].isalpha() and cleaned[1:4].isdigit() and cleaned[4:6].isalpha():
+        cleaned = "01" + cleaned
+
+    # Smart correction: If 7 characters like GB456CD or 1B456CD, region code was partially captured
+    if len(cleaned) == 7 and cleaned[1].isalpha() and cleaned[2:5].isdigit() and cleaned[5:7].isalpha():
+        cleaned = "01" + cleaned[1:]
+
     if len(cleaned) < 7 or len(cleaned) > 9:
         return NormalizationResult(
             original=raw_text,

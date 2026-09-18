@@ -1,11 +1,13 @@
 import asyncio
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 import cv2
 from fastapi import APIRouter, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
 import numpy as np
 from pydantic import BaseModel
 
+from app.camera.file import FileCameraStream
+from app.camera.rtsp import RTSPCameraStream
 from app.parking.event import ParkingEvent
 from app.utils.image import encode_image_to_jpeg
 from app.vision.normalizer import normalize_plate
@@ -15,12 +17,31 @@ from app.vision.quality import compute_plate_quality
 router = APIRouter(prefix="/api/v1", tags=["Diagnostics & Control"])
 
 
-class InjectPlateRequest(BaseModel):
-    plate_number: str
+class SwitchVideoRequest(BaseModel):
+    video_filename: str
+
+
+class CameraConfigRequest(BaseModel):
+    mode: str = "VIDEO_FILE"  # "RTSP" or "VIDEO_FILE"
+    rtsp_url: Optional[str] = None
+    video_file_path: Optional[str] = None
+    fps: Optional[int] = 10
+
+
+class TestRtspRequest(BaseModel):
+    rtsp_url: str
 
 
 @router.get("/cameras")
 async def list_cameras(request: Request) -> Dict[str, Any]:
+    manager = getattr(request.app.state, "camera_manager", None)
+    if manager:
+        return {
+            "success": True,
+            "data": manager.list_cameras_info(),
+        }
+
+    # Fallback to single pipeline if manager not present
     cfg = request.app.state.config
     pipeline = getattr(request.app.state, "pipeline", None)
     status = pipeline.stream.status.value if pipeline and pipeline.stream else "OFFLINE"
@@ -36,16 +57,31 @@ async def list_cameras(request: Request) -> Dict[str, Any]:
                 "parking_id": cfg.parking_id,
                 "video_source": cfg.video_source,
                 "status": status,
-                "fps": fps,
+                "fps": round(fps, 1),
                 "target_fps": cfg.target_fps,
+                "state": "ACTIVE" if status == "ONLINE" else "IDLE",
             }
         ],
     }
 
 
+@router.get("/videos")
+async def list_videos(request: Request) -> Dict[str, Any]:
+    """List all available test videos in test-videos/ folder."""
+    manager = getattr(request.app.state, "camera_manager", None)
+    if not manager:
+        return {"success": True, "data": []}
+    return {
+        "success": True,
+        "data": manager.list_available_videos(),
+    }
+
+
 @router.get("/cameras/{camera_id}/snapshot")
 async def get_camera_snapshot(camera_id: str, request: Request) -> Response:
-    pipeline = getattr(request.app.state, "pipeline", None)
+    manager = getattr(request.app.state, "camera_manager", None)
+    pipeline = manager.get_pipeline(camera_id) if manager else getattr(request.app.state, "pipeline", None)
+
     if not pipeline or pipeline.latest_frame is None:
         raise HTTPException(status_code=404, detail="Snapshot not available")
 
@@ -59,7 +95,9 @@ async def get_camera_snapshot(camera_id: str, request: Request) -> Response:
 
 @router.get("/cameras/{camera_id}/stream")
 async def stream_camera(camera_id: str, request: Request) -> StreamingResponse:
-    pipeline = getattr(request.app.state, "pipeline", None)
+    manager = getattr(request.app.state, "camera_manager", None)
+    pipeline = manager.get_pipeline(camera_id) if manager else getattr(request.app.state, "pipeline", None)
+
     if not pipeline:
         raise HTTPException(status_code=404, detail="Camera pipeline not initialized")
 
@@ -85,74 +123,101 @@ async def stream_camera(camera_id: str, request: Request) -> StreamingResponse:
     )
 
 
-@router.post("/cameras/{camera_id}/inject-plate")
-async def inject_test_plate(
-    camera_id: str, payload: InjectPlateRequest, request: Request
+@router.post("/cameras/{camera_id}/switch-video")
+async def switch_camera_video(
+    camera_id: str, payload: SwitchVideoRequest, request: Request
 ) -> Dict[str, Any]:
-    """Inject a test plate for synthetic end-to-end testing."""
-    if not payload.plate_number:
-        raise HTTPException(status_code=400, detail="plate_number is required")
+    """Switch video source for a specific camera pipeline."""
+    manager = getattr(request.app.state, "camera_manager", None)
+    if not manager:
+        raise HTTPException(status_code=500, detail="CameraManager not initialized")
 
-    cfg = request.app.state.config
-    pipeline = getattr(request.app.state, "pipeline", None)
-    if not pipeline:
-        raise HTTPException(status_code=500, detail="Pipeline not initialized")
-
-    norm = normalize_plate(payload.plate_number)
-    event = ParkingEvent(
-        camera_id=camera_id,
-        direction=cfg.camera_direction,
-        plate_number=norm.normalized if norm.is_valid else payload.plate_number,
-        confidence=0.95,
-        track_id="inject-sim",
-        sample_count=3,
-    )
-
-    # Dispatch to backend
-    await pipeline.backend.send_event(event)
+    success = await manager.switch_video(camera_id, payload.video_filename)
+    if not success:
+        raise HTTPException(status_code=400, detail=f"Failed to switch video to {payload.video_filename}")
 
     return {
         "success": True,
-        "message": f"Injected plate {event.plate_number} and triggered backend event",
-        "data": event.to_backend_payload(),
+        "message": f"Camera {camera_id} video successfully switched to {payload.video_filename}",
+        "video": payload.video_filename,
     }
 
 
-@router.post("/cameras/{camera_id}/test-image")
-async def test_image_ocr(
-    camera_id: str, request: Request, image: UploadFile = File(...)
+@router.put("/cameras/{camera_id}/config")
+async def configure_camera(
+    camera_id: str, payload: CameraConfigRequest, request: Request
 ) -> Dict[str, Any]:
-    """Upload an image to test quality check, preprocessing, and OCR directly."""
-    pipeline = getattr(request.app.state, "pipeline", None)
+    """Configure or switch video / RTSP stream for a camera."""
+    manager = getattr(request.app.state, "camera_manager", None)
+    if not manager:
+        raise HTTPException(status_code=500, detail="CameraManager not initialized")
+
+    pipeline = manager.get_pipeline(camera_id)
     if not pipeline:
-        raise HTTPException(status_code=500, detail="Pipeline not initialized")
+        raise HTTPException(status_code=404, detail="Camera not found")
 
-    contents = await image.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Invalid image file")
+    fps = payload.fps or 10
 
-    quality = compute_plate_quality(img)
-    preprocessed = preprocess_plate(img)
-    ocr_results = pipeline.ocr_engine.recognize(preprocessed, camera_id=camera_id)
+    if payload.mode == "RTSP" and payload.rtsp_url:
+        import re
+        url = payload.rtsp_url.strip()
+        m = re.match(r"^(rtsp://)([^/:]+)(/.*)?$", url)
+        if m:
+            # If standard 554 not accessible, use 8080
+            host = m.group(2)
+            path = m.group(3) or ""
+            url = f"rtsp://{host}:8080{path}"
 
-    raw_text = ocr_results[0].text if ocr_results else ""
-    confidence = ocr_results[0].confidence if ocr_results else 0.0
-    norm = normalize_plate(raw_text)
+        pipeline.stream.stop()
+        new_stream = RTSPCameraStream(
+            camera_id=camera_id,
+            rtsp_url=url,
+            target_fps=fps,
+        )
+        new_stream.start()
+        pipeline.stream = new_stream
+        pipeline.current_video_file = url
+        return {"success": True, "message": f"Camera {camera_id} connected to RTSP stream: {url}"}
+
+    elif payload.video_file_path:
+        filename = payload.video_file_path.split("/")[-1]
+        success = await manager.switch_video(camera_id, filename)
+        if success:
+            return {"success": True, "message": f"Camera {camera_id} switched to {filename}"}
+
+    return {"success": True, "message": "Camera config updated"}
+
+
+@router.post("/cameras/test-rtsp")
+async def test_rtsp_connection(payload: TestRtspRequest) -> Dict[str, Any]:
+    """Test connection to RTSP stream, with smart IP Webcam port 8080 fallback."""
+    raw_url = payload.rtsp_url.strip()
+    urls_to_try = [raw_url]
+
+    # If user provided IP Webcam url without port, e.g. rtsp://10.80.113.163/h264_ulaw.sdp
+    import re
+    m = re.match(r"^(rtsp://)([^/:]+)(/.*)?$", raw_url)
+    if m:
+        host = m.group(2)
+        path = m.group(3) or ""
+        urls_to_try.append(f"rtsp://{host}:8080{path}")
+        urls_to_try.append(f"http://{host}:8080/video")
+
+    for u in urls_to_try:
+        try:
+            cap = cv2.VideoCapture(u)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                cap.release()
+                if ret and frame is not None:
+                    msg = "RTSP ulanishi muvaffaqiyatli! Video oqimi qabul qilindi."
+                    if u != raw_url:
+                        msg = f"RTSP muvaffaqiyatli ulandi! (IP Webcam port 8080 qo'shildi: {u})"
+                    return {"success": True, "message": msg, "effective_url": u}
+        except Exception:
+            pass
 
     return {
-        "success": True,
-        "raw_ocr": raw_text,
-        "ocr_confidence": round(confidence, 4),
-        "normalized_plate": norm.normalized,
-        "is_valid": norm.is_valid,
-        "plate_type": norm.plate_type,
-        "quality": {
-            "sharpness": quality.sharpness,
-            "brightness": quality.brightness,
-            "contrast": quality.contrast,
-            "is_acceptable": quality.is_acceptable,
-            "rejection_reason": quality.rejection_reason,
-        },
+        "success": False,
+        "message": "RTSP serveriga ulanib bo'lmadi. Telefon IP Webcam uchun portni tekshiring: masalan, rtsp://10.80.113.163:8080/h264_ulaw.sdp",
     }

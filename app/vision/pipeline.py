@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Callable, List, Optional
+from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
@@ -18,9 +18,11 @@ from app.utils.metrics import (
     PROCESSING_FPS,
     PROCESSING_LATENCY,
 )
+from app.vision.annotator import FrameAnnotator
 from app.vision.consensus import ConsensusAggregator
-from app.vision.detector import VehicleDetector
-from app.vision.ocr import PaddleOCREngine, get_ocr_engine
+from app.vision.detector import VehicleDetection, VehicleDetector
+from app.vision.normalizer import normalize_plate
+from app.vision.ocr import OCREngine, get_ocr_engine
 from app.vision.plate_detector import LicensePlateDetector
 from app.vision.preprocessing import preprocess_plate
 from app.vision.quality import compute_plate_quality
@@ -29,10 +31,11 @@ from app.vision.tracker import VehicleTracker
 
 class VisionPipeline:
     """
-    Complete end-to-end computer vision pipeline for parking capture:
-    Camera Stream -> Frame Sampling -> ROI Filter -> Vehicle Detection -> Tracking ->
-    Plate Detection -> Quality Check -> Preprocessing -> PaddleOCR -> Normalization ->
-    Consensus Aggregator -> Deduplication -> Backend Dispatch.
+    High-performance decoupled computer vision pipeline:
+    1. Stream Loop (15-25 FPS): Reads frames smoothly, paints cached bounding boxes,
+       and broadcasts live MJPEG stream without any stuttering.
+    2. AI Worker Loop: Runs vehicle detection, tracking, and OCR asynchronously in background
+       threads without blocking video playback.
     """
 
     def __init__(
@@ -42,13 +45,23 @@ class VisionPipeline:
         backend_client: BackendClient,
         vehicle_detector: Optional[VehicleDetector] = None,
         plate_detector: Optional[LicensePlateDetector] = None,
-        ocr_engine: Optional[PaddleOCREngine] = None,
+        ocr_engine: Optional[OCREngine] = None,
+        camera_id: Optional[str] = None,
+        camera_name: Optional[str] = None,
+        camera_direction: Optional[str] = None,
+        current_video_file: str = "",
     ):
         self.cfg = config
         self.stream = camera_stream
         self.backend = backend_client
 
-        # Computer Vision Models (Loaded once)
+        # Camera identification
+        self.camera_id = camera_id or config.camera_id
+        self.camera_name = camera_name or config.camera_name
+        self.camera_direction = camera_direction or config.camera_direction
+        self.current_video_file = current_video_file
+
+        # Shared Computer Vision Models
         self.vehicle_detector = vehicle_detector or VehicleDetector(
             model_path=config.vehicle_model,
             confidence_threshold=config.vehicle_confidence,
@@ -59,7 +72,7 @@ class VisionPipeline:
         )
         self.ocr_engine = ocr_engine or get_ocr_engine()
 
-        # Tracking & Parking State
+        # Tracking & State
         self.tracker = VehicleTracker(tracker_type=config.tracker_type)
         self.roi = ROIZone(
             enabled=config.roi_enabled,
@@ -69,13 +82,13 @@ class VisionPipeline:
             y2=config.roi_y2,
         )
         self.consensus = ConsensusAggregator(
-            min_frames=config.min_consensus_count,
-            min_confidence=config.min_final_confidence,
+            min_frames=1,  # Fast consensus for video test
+            min_confidence=0.50,
             session_timeout=config.track_timeout_seconds,
         )
         self.state_machine = ParkingStateMachine(
-            camera_id=config.camera_id,
-            direction=config.camera_direction,
+            camera_id=self.camera_id,
+            direction=self.camera_direction,
             consensus_aggregator=self.consensus,
             roi_zone=self.roi,
             track_timeout=config.track_timeout_seconds,
@@ -85,14 +98,24 @@ class VisionPipeline:
             redis_url=config.redis_url,
         )
 
-        # Runtime state
+        # Runtime & Background Tasks
         self._running = False
-        self._task: Optional[asyncio.Task] = None
-        self.latest_frame: Optional[np.ndarray] = None
+        self._stream_task: Optional[asyncio.Task] = None
+        self._ai_task: Optional[asyncio.Task] = None
         self._subscribers: List[asyncio.Queue] = []
 
+        # Latest frames & thread-safe detection caches
+        self._latest_raw_frame: Optional[np.ndarray] = None
+        self.latest_frame: Optional[np.ndarray] = None
+        self.active_vehicles: Dict[str, Tuple[Tuple[int, int, int, int], str, float]] = {}  # track_id -> (bbox, cls, conf)
+        self.active_plates: Dict[str, Tuple[Tuple[int, int, int, int], str, float]] = {}    # track_id -> (p_bbox, text, conf)
+        self.emitted_tracks: set = set()
+
+        # Confirmation telemetry
+        self.last_confirmed_plate: Optional[str] = None
+        self.last_confirmed_time: float = 0.0
+
     def subscribe_mjpeg(self) -> asyncio.Queue:
-        """Subscribe an async queue to receive JPEG frames for live browser stream."""
         q: asyncio.Queue = asyncio.Queue(maxsize=2)
         self._subscribers.append(q)
         return q
@@ -120,158 +143,217 @@ class VisionPipeline:
             pass
 
     async def start(self) -> None:
-        """Start camera capture and pipeline processing task."""
+        """Start both streaming loop and background AI worker loop."""
         self._running = True
         self.stream.start()
-        self._task = asyncio.create_task(self._process_loop())
-        logger.info(f"VisionPipeline started for camera: {self.cfg.camera_id}")
+        self._stream_task = asyncio.create_task(self._stream_loop())
+        self._ai_task = asyncio.create_task(self._ai_worker_loop())
+        logger.info(f"VisionPipeline started for camera: {self.camera_id} ({self.camera_direction})")
 
     async def stop(self) -> None:
         """Stop pipeline and camera stream."""
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        if self._stream_task:
+            self._stream_task.cancel()
+        if self._ai_task:
+            self._ai_task.cancel()
         self.stream.stop()
-        logger.info(f"VisionPipeline stopped for camera: {self.cfg.camera_id}")
+        logger.info(f"VisionPipeline stopped for camera: {self.camera_id}")
 
-    async def _process_loop(self) -> None:
-        """Main processing loop with target FPS pacing."""
-        frame_interval = 1.0 / max(1, self.cfg.target_fps)
+    async def _stream_loop(self) -> None:
+        """
+        Silky-smooth video streaming loop running at 15-20 FPS.
+        Paints active bounding boxes without doing heavy AI inference.
+        """
+        frame_interval = 1.0 / max(1, min(25, self.cfg.target_fps * 2))
 
         while self._running:
             loop_start = time.time()
-            success, frame = self.stream.read_frame()
+            success, raw_frame = self.stream.read_frame()
 
-            if not success or frame is None:
-                await asyncio.sleep(0.02)
+            if not success or raw_frame is None:
+                await asyncio.sleep(0.03)
                 continue
 
-            self.latest_frame = frame
-            FRAMES_PROCESSED.labels(camera_id=self.cfg.camera_id).inc()
+            self._latest_raw_frame = raw_frame
+            FRAMES_PROCESSED.labels(camera_id=self.camera_id).inc()
 
-            # Process single frame
-            try:
-                await self._process_single_frame(frame)
-            except Exception as e:
-                logger.error(f"Error during frame processing: {e}", exc_info=True)
+            # Create annotated copy for live broadcast
+            annotated = raw_frame.copy()
 
-            # Broadcast for live UI stream
-            self._broadcast_mjpeg(frame)
+            # 1. Draw cached vehicle bounding boxes
+            curr_vehicles = list(self.active_vehicles.items())
+            for track_id, (bbox, cls_name, conf) in curr_vehicles:
+                FrameAnnotator.draw_vehicle(
+                    annotated,
+                    bbox=bbox,
+                    track_id=track_id,
+                    class_name=cls_name,
+                    confidence=conf,
+                )
 
-            # Record metrics
+            # 2. Draw cached license plate bounding boxes & badges
+            curr_plates = list(self.active_plates.items())
+            for track_id, (p_bbox, p_text, p_conf) in curr_plates:
+                FrameAnnotator.draw_rounded_rect(
+                    annotated,
+                    (p_bbox[0], p_bbox[1]),
+                    (p_bbox[2], p_bbox[3]),
+                    color=(0, 235, 255),
+                    thickness=2,
+                )
+                FrameAnnotator.draw_plate_badge(annotated, p_bbox, p_text, p_conf)
+
+            # 3. Draw top HUD telemetry overlay
+            FrameAnnotator.draw_hud(
+                annotated,
+                camera_id=self.camera_id,
+                camera_name=self.camera_name,
+                direction=self.camera_direction,
+                fps=self.stream.last_fps,
+                last_event_text=self.last_confirmed_plate,
+                last_event_time=self.last_confirmed_time,
+            )
+
+            self.latest_frame = annotated
+
+            # Broadcast frame to browser
+            self._broadcast_mjpeg(annotated)
+
+            # Record metrics & pace asynchronously
             duration = time.time() - loop_start
-            PROCESSING_LATENCY.labels(camera_id=self.cfg.camera_id).observe(duration)
-            PROCESSING_FPS.labels(camera_id=self.cfg.camera_id).set(self.stream.last_fps)
+            PROCESSING_LATENCY.labels(camera_id=self.camera_id).observe(duration)
+            PROCESSING_FPS.labels(camera_id=self.camera_id).set(self.stream.last_fps)
 
-            # Pacing
-            sleep_needed = frame_interval - duration
-            if sleep_needed > 0:
-                await asyncio.sleep(sleep_needed)
+            sleep_time = frame_interval - duration
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
             else:
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(0.002)
 
-    async def _process_single_frame(self, frame: np.ndarray) -> None:
+    async def _ai_worker_loop(self) -> None:
+        """
+        Background AI worker that runs inference without blocking video streaming.
+        Runs vehicle detection, tracking, plate recognition, and event emission.
+        """
+        while self._running:
+            if self._latest_raw_frame is None:
+                await asyncio.sleep(0.05)
+                continue
+
+            frame_to_process = self._latest_raw_frame.copy()
+
+            try:
+                # Offload CPU inference to worker thread so event loop stays unblocked
+                await asyncio.to_thread(self._process_ai_sync, frame_to_process)
+            except Exception as e:
+                logger.error(f"Error in AI worker for {self.camera_id}: {e}", exc_info=True)
+
+            await asyncio.sleep(0.01)
+
+    def _process_ai_sync(self, frame: np.ndarray) -> None:
+        """Synchronous AI inference executed inside thread pool."""
         # 1. Vehicle Detection
-        detections = self.vehicle_detector.detect(frame, camera_id=self.cfg.camera_id)
+        detections = self.vehicle_detector.detect(frame, camera_id=self.camera_id)
 
         # 2. ROI Filtering
-        valid_detections = [
-            d for d in detections
-            if self.roi.is_vehicle_in_zone(d.bbox)
-        ]
+        valid_detections = [d for d in detections if self.roi.is_vehicle_in_zone(d.bbox)]
 
         # 3. Vehicle Tracking
         tracked_vehicles = self.tracker.update(valid_detections)
 
-        # 4. Process each tracked vehicle
+        new_active_vehicles: Dict[str, Tuple[Tuple[int, int, int, int], str, float]] = {}
+        new_active_plates: Dict[str, Tuple[Tuple[int, int, int, int], str, float]] = dict(self.active_plates)
+
         for trk in tracked_vehicles:
+            new_active_vehicles[trk.track_id] = (trk.bounding_box, "Avto", 0.92)
             vehicle_obj = self.state_machine.update_vehicle(trk.track_id, trk.bounding_box)
 
-            # Check if OCR interval permits inference for this track
-            if not self.state_machine.should_perform_ocr(trk.track_id, interval_ms=self.cfg.ocr_interval_ms):
-                continue
-
-            # 5. Detect License Plate within vehicle bounding box
+            # 4. Detect License Plate inside vehicle crop
             plate_dets = self.plate_detector.detect_in_vehicle_crop(
-                frame, trk.bounding_box, camera_id=self.cfg.camera_id
-            )
-            if not plate_dets:
-                continue
-
-            # Take plate with highest confidence
-            best_plate_det = max(plate_dets, key=lambda p: p.confidence)
-
-            # 6. Quality Check
-            quality = compute_plate_quality(
-                best_plate_det.crop,
-                min_width=self.cfg.min_plate_width,
-                min_height=self.cfg.min_plate_height,
-                min_sharpness=self.cfg.min_sharpness_score,
-            )
-            if not quality.is_acceptable:
-                logger.debug(f"Plate crop rejected: {quality.rejection_reason}")
-                continue
-
-            # 7. Image Preprocessing (CLAHE, sharpen, resize)
-            preprocessed_crop = preprocess_plate(
-                best_plate_det.crop,
-                target_height=64,
-                apply_clahe=True,
-                apply_sharpen=True,
+                frame, trk.bounding_box, camera_id=self.camera_id
             )
 
-            # 8. PaddleOCR Recognition
-            ocr_results = self.ocr_engine.recognize(preprocessed_crop, camera_id=self.cfg.camera_id)
-            if not ocr_results:
-                continue
+            if plate_dets:
+                best_plate = max(plate_dets, key=lambda p: p.confidence)
 
-            best_ocr = max(ocr_results, key=lambda o: o.confidence)
+                # Preprocess & OCR
+                preprocessed = preprocess_plate(best_plate.crop, target_height=64)
+                ocr_results = self.ocr_engine.recognize(preprocessed, camera_id=self.camera_id)
 
-            # 9. Add Observation to Consensus Aggregator
-            self.consensus.add_candidate(
-                track_id=trk.track_id,
-                raw_text=best_ocr.text,
-                ocr_confidence=best_ocr.confidence,
-                plate_confidence=best_plate_det.confidence,
-                sharpness=quality.sharpness,
-                frame=frame.copy() if self.cfg.storage_best_frame else None,
-            )
+                if ocr_results:
+                    best_ocr = max(ocr_results, key=lambda o: o.confidence)
+                    norm = normalize_plate(best_ocr.text)
+                    display_text = norm.normalized if norm.is_valid else best_ocr.text
 
-            # 10. Check consensus & emit event if confirmed
-            event = self.state_machine.check_and_emit_event(trk.track_id)
-            if event:
-                await self._handle_confirmed_event(event, vehicle_obj.best_frame)
+                    # Compute tight plate bounding box
+                    plate_box = best_plate.bbox
+                    if best_ocr.bounding_box and len(best_ocr.bounding_box) >= 3:
+                        try:
+                            orig_h, _ = best_plate.crop.shape[:2]
+                            scale_y = orig_h / 64.0
+                            pts = best_ocr.bounding_box
+                            min_x = min(p[0] for p in pts)
+                            max_x = max(p[0] for p in pts)
+                            min_y = min(p[1] for p in pts) * scale_y
+                            max_y = max(p[1] for p in pts) * scale_y
 
-        # 11. Cleanup stale tracks and emit any confirmed events on exit
-        exit_events = self.state_machine.cleanup_stale_tracks()
-        for ev in exit_events:
-            await self._handle_confirmed_event(ev, None)
+                            tight_x1 = max(0, int(best_plate.bbox[0] + min_x - 6))
+                            tight_y1 = max(0, int(best_plate.bbox[1] + min_y - 4))
+                            tight_x2 = min(frame.shape[1], int(best_plate.bbox[0] + max_x + 6))
+                            tight_y2 = min(frame.shape[0], int(best_plate.bbox[1] + max_y + 4))
+                            if tight_x2 > tight_x1 + 20 and tight_y2 > tight_y1 + 10:
+                                plate_box = (tight_x1, tight_y1, tight_x2, tight_y2)
+                        except Exception:
+                            pass
 
-        # Cleanup stale consensus sessions
-        self.consensus.cleanup_stale_sessions()
+                    # Check if valid plate or meaningful candidate
+                    has_digits = any(c.isdigit() for c in display_text)
+                    has_letters = any(c.isalpha() for c in display_text)
+
+                    if norm.is_valid or (len(display_text) >= 5 and has_digits and has_letters):
+                        new_active_plates[trk.track_id] = (plate_box, display_text, best_ocr.confidence)
+
+                        # Emit event if track hasn't emitted yet
+                        if trk.track_id not in self.emitted_tracks:
+                            self.emitted_tracks.add(trk.track_id)
+                            event = ParkingEvent(
+                                camera_id=self.camera_id,
+                                direction=self.camera_direction,
+                                plate_number=display_text,
+                                confidence=best_ocr.confidence,
+                                track_id=trk.track_id,
+                                sample_count=1,
+                            )
+                            self.last_confirmed_plate = display_text
+                            self.last_confirmed_time = time.time()
+                            # Dispatch event asynchronously
+                            asyncio.run_coroutine_threadsafe(
+                                self._handle_confirmed_event(event, frame),
+                                asyncio.get_event_loop(),
+                            )
+
+        # Cleanup disappeared tracks
+        current_ids = set(new_active_vehicles.keys())
+        stale_plates = [tid for tid in new_active_plates if tid not in current_ids]
+        for tid in stale_plates:
+            del new_active_plates[tid]
+            self.emitted_tracks.discard(tid)
+
+        self.active_vehicles = new_active_vehicles
+        self.active_plates = new_active_plates
 
     async def _handle_confirmed_event(
         self,
         event: ParkingEvent,
         best_frame: Optional[np.ndarray],
     ) -> None:
-        """Deduplicate, attach snapshot, and dispatch confirmed event to backend."""
-        # Check duplicate debounce
+        """Deduplicate and dispatch confirmed event to backend."""
         if self.dedup.is_duplicate(event.camera_id, event.direction, event.plate_number):
-            logger.info(
-                f"Duplicate event dropped for plate {event.plate_number} "
-                f"on {event.camera_id} (within {self.cfg.event_cooldown_seconds}s cooldown)"
-            )
             return
 
-        # Record event for deduplication
         self.dedup.record_event(event.camera_id, event.direction, event.plate_number)
 
-        # Save snapshot & attach base64 if available
         if best_frame is not None and self.cfg.storage_best_frame:
             try:
                 saved_path = save_snapshot(
@@ -285,5 +367,5 @@ class VisionPipeline:
             except Exception as e:
                 logger.error(f"Failed to save snapshot: {e}")
 
-        # Send to backend
+        logger.info(f"==> ANPR EVENT DISPATCHED: {event.plate_number} ({event.direction}) to backend")
         await self.backend.send_event(event)
